@@ -1,0 +1,1123 @@
+# =============================================================================
+# KONTRAK API: CekJajan Service (Kelompok MandaBita)
+# Versi 0.2.0. Dasar: makalah DDD CekJajan + deck Tugas Besar TST x PWAM.
+#
+# CATATAN
+#   - Hasil penilaian bersifat PERKIRAAN, bukan diagnosis (sesuai makalah).
+#   - Pemindaian barcode dan OCR dilakukan di aplikasi mobile, bukan di server.
+#   - Data pengguna di tahap pengembangan memakai DATA UJI, bukan data asli.
+#   - Di luar cakupan versi ini: Audit Kantin, Program Kesehatan (Dinas),
+#     Langganan & Pembayaran (konteks lain di makalah, pengembangan lanjutan).
+# =============================================================================
+openapi: 3.0.3
+
+info:
+  title: CekJajan Service API
+  version: 0.2.0
+  description: |
+    Layanan inti CekJajan: **Penilaian Gizi** (kandungan gula, garam, lemak per sajian,
+    penanda ilustrasi dari paling baik ke paling buruk, dan perkiraan Nutri-Level) serta
+    **Jatah GGL Harian** per usia anak (4 sampai 12 tahun).
+
+    ## Autentikasi
+    | Pemanggil | Cara |
+    |---|---|
+    | Pengguna aplikasi (orang tua, anak) | `Authorization: Bearer <JWT>` dari `/auth/login` |
+    | Kelompok lain (server ke server) | header `X-API-Key` |
+    | Publik | tanpa autentikasi, dibatasi rate limit (`/health`, `/assessments/quick`) |
+
+    ## Cara mendapat akses (kelompok lain)
+    1. Minta API key ke kelompok MandaBita. Satu API key diberikan untuk setiap kelompok pemanggil.
+    2. Minta akun uji (role orang tua) untuk mencoba endpoint yang memakai JWT.
+    3. Laporkan bug lewat GitHub Issue pada repositori layanan ini.
+
+    ## Batas pemanggilan
+    60 request per menit per IP untuk endpoint publik, 300 request per menit per API key.
+    Respons `429` menyertakan header `Retry-After`.
+
+    ## Konvensi
+    Path memakai bahasa Inggris. Nama field memakai istilah domain dari makalah (bahasa Indonesia,
+    snake_case).
+  contact:
+    name: Kelompok MandaBita
+
+servers:
+  - url: https://mandabita.stei.site/api
+    description: Produksi (Cloudflare Tunnel ke STB). Kelas K02 memakai stei.site.
+  - url: http://localhost:8080/api
+    description: Lokal (pengembangan)
+
+tags:
+  - name: Publik
+    description: Tanpa login, dibatasi rate limit.
+  - name: Auth
+    description: Registrasi dan login pengguna aplikasi.
+  - name: Produk
+    description: Katalog produk dan data gizinya.
+  - name: Penilaian
+    description: Penilaian GGL dan perkiraan Nutri-Level.
+  - name: Anak
+    description: Profil anak di bawah akun orang tua.
+  - name: Jatah Harian
+    description: Jatah GGL harian per anak dan pencatatan konsumsi.
+
+paths:
+  /health:
+    get:
+      tags: [Publik]
+      summary: Cek layanan hidup
+      security: []
+      responses:
+        "200":
+          description: Layanan hidup.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+              example:
+                status: ok
+                service: cekjajan
+                version: 0.2.0
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /assessments/quick:
+    get:
+      tags: [Publik, Penilaian]
+      summary: Penilaian cepat dari nilai gizi (tanpa login)
+      description: |
+        Endpoint GET publik untuk kelompok lain. Kirim nilai gizi **per sajian** dari tabel
+        informasi nilai gizi, dapatkan GGL per sajian, penanda ilustrasi, dan
+        perkiraan Nutri-Level. Tidak menyimpan data apa pun.
+
+        Aturan penilaian: ambang Nutri-Level mengacu pada Peraturan BPOM Nomor 10 Tahun 2026
+        tentang Informasi Nilai Gizi pada Label Pangan Olahan, dihitung per 100 g atau 100 ml
+        (gula, natrium, lemak total). Level terburuk dari ketiga zat yang dipakai.
+
+        | Level | Gula | Natrium | Lemak total |
+        |---|---|---|---|
+        | A | < 0,5 g | < 5 mg | < 0,5 g |
+        | B | 0,5 sampai < 6 g | 5 sampai < 120 mg | 0,5 sampai < 3 g |
+        | C | 6 sampai 12,5 g | 120 sampai < 500 mg | 3 sampai < 17 g |
+        | D | > 12,5 g | > 500 mg | > 17 g |
+
+        **Penanda.** Setiap zat (gula, garam, lemak) dan hasil keseluruhan diberi penanda berupa
+        ilustrasi pada skala 1 (paling baik) sampai 4 (paling buruk), mengikuti level A sampai D:
+        1 = A ikon `sangat_baik` (hijau tua), 2 = B ikon `baik` (hijau muda),
+        3 = C ikon `hati_hati` (kuning), 4 = D ikon `batasi` (merah).
+        Penanda keseluruhan mengikuti zat yang terburuk.
+
+        Aturan BPOM resmi hanya mencakup minuman. Untuk makanan padat, ambang yang sama dipakai
+        per 100 g sebagai **perkiraan**. Syarat penggunaan pemanis pada level A dan B tidak dinilai
+        karena tidak ada pada data masukan.
+      security: []
+      parameters:
+        - name: takaran_saji
+          in: query
+          required: true
+          description: Besar satu sajian.
+          schema: {type: number, minimum: 0.1, example: 30}
+        - name: satuan_takaran
+          in: query
+          required: true
+          description: Satuan takaran. Nutri-Level dihitung per 100 g atau 100 ml.
+          schema: {type: string, enum: [g, ml], example: g}
+        - name: gula_g
+          in: query
+          required: true
+          description: Gula per sajian, gram.
+          schema: {type: number, minimum: 0, example: 6}
+        - name: natrium_mg
+          in: query
+          required: true
+          description: Natrium per sajian, miligram (garam dihitung dari natrium).
+          schema: {type: number, minimum: 0, example: 110}
+        - name: lemak_g
+          in: query
+          required: true
+          description: Lemak total per sajian, gram.
+          schema: {type: number, minimum: 0, example: 7}
+      responses:
+        "200":
+          description: Hasil penilaian.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Assessment"
+              examples:
+                biskuit:
+                  summary: Contoh biskuit (angka ilustrasi, bukan acuan resmi)
+                  value:
+                    sumber_data: input_langsung
+                    ggl_per_sajian:
+                      gula_g: 6
+                      garam_g: 0.275
+                      lemak_g: 7
+                    nutri_level: D
+                    penanda: {level: D, skala: 4, ikon: batasi, label: Batasi, warna: merah}
+                    penanda_zat:
+                      gula: {level: D, skala: 4, ikon: batasi, label: Batasi, warna: merah}
+                      garam: {level: C, skala: 3, ikon: hati_hati, label: Hati-hati, warna: kuning}
+                      lemak: {level: D, skala: 4, ikon: batasi, label: Batasi, warna: merah}
+                    ringkasan: Gula dan lemak tinggi per 100 g, natrium sedang. Sebaiknya dibatasi (perkiraan, memakai ambang minuman BPOM).
+                    dampak_jatah_harian: null
+                    disclaimer: Hasil berupa perkiraan, bukan diagnosis atau pengganti saran tenaga kesehatan.
+                    dinilai_pada: "2026-11-23T08:00:00Z"
+                minuman_manis:
+                  summary: Contoh minuman manis per sajian 200 ml (angka ilustrasi, bukan acuan resmi)
+                  value:
+                    sumber_data: input_langsung
+                    ggl_per_sajian:
+                      gula_g: 15
+                      garam_g: 0.075
+                      lemak_g: 0
+                    nutri_level: C
+                    penanda: {level: C, skala: 3, ikon: hati_hati, label: Hati-hati, warna: kuning}
+                    penanda_zat:
+                      gula: {level: C, skala: 3, ikon: hati_hati, label: Hati-hati, warna: kuning}
+                      garam: {level: B, skala: 2, ikon: baik, label: Baik, warna: hijau_muda}
+                      lemak: {level: A, skala: 1, ikon: sangat_baik, label: Sangat baik, warna: hijau_tua}
+                    ringkasan: Gula cukup tinggi untuk satu gelas. Pilih yang lebih rendah gula bila sering diminum.
+                    dampak_jatah_harian: null
+                    disclaimer: Hasil berupa perkiraan, bukan diagnosis atau pengganti saran tenaga kesehatan.
+                    dinilai_pada: '2026-11-23T08:00:00Z'
+                minuman_tawar:
+                  summary: Contoh minuman tanpa gula (angka ilustrasi, bukan acuan resmi)
+                  value:
+                    sumber_data: input_langsung
+                    ggl_per_sajian:
+                      gula_g: 0
+                      garam_g: 0.0125
+                      lemak_g: 0
+                    nutri_level: A
+                    penanda: {level: A, skala: 1, ikon: sangat_baik, label: Sangat baik, warna: hijau_tua}
+                    penanda_zat:
+                      gula: {level: A, skala: 1, ikon: sangat_baik, label: Sangat baik, warna: hijau_tua}
+                      garam: {level: A, skala: 1, ikon: sangat_baik, label: Sangat baik, warna: hijau_tua}
+                      lemak: {level: A, skala: 1, ikon: sangat_baik, label: Sangat baik, warna: hijau_tua}
+                    ringkasan: Tidak mengandung gula dan lemak, garam sangat rendah.
+                    dampak_jatah_harian: null
+                    disclaimer: Hasil berupa perkiraan, bukan diagnosis atau pengganti saran tenaga kesehatan.
+                    dinilai_pada: '2026-11-23T08:00:00Z'
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Daftar akun orang tua
+      description: |
+        Mendaftarkan akun dengan role `orang_tua`. Role lain (`pengelola_sekolah`, `petugas_dinas`)
+        di luar cakupan versi ini.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+            example:
+              nama: Orang Tua Uji
+              email: ortu.uji@example.com
+              password: PasswordContoh123
+      responses:
+        "201":
+          description: Akun dibuat.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+              example:
+                id: usr-001
+                nama: Orang Tua Uji
+                email: ortu.uji@example.com
+                role: orang_tua
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Login, dapatkan JWT
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+            example:
+              email: ortu.uji@example.com
+              password: PasswordContoh123
+      responses:
+        "200":
+          description: Login berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthToken"
+              example:
+                token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.contoh.contoh
+                token_type: Bearer
+                expires_in: 86400
+                user:
+                  id: usr-001
+                  nama: Orang Tua Uji
+                  email: ortu.uji@example.com
+                  role: orang_tua
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Profil pengguna yang sedang login
+      security:
+        - BearerJWT: []
+      responses:
+        "200":
+          description: Data pengguna.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+              example:
+                id: usr-001
+                nama: Orang Tua Uji
+                email: ortu.uji@example.com
+                role: orang_tua
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /products/{barcode}:
+    get:
+      tags: [Produk]
+      summary: Cari produk dari barcode
+      description: |
+        Urutan pencarian: katalog CekJajan, lalu Open Food Facts. Hasil dari Open Food Facts
+        disimpan ke katalog dengan `status_verifikasi: belum_terverifikasi`.
+        Bila tidak ditemukan, kembalikan `404` dan aplikasi menawarkan input manual (`POST /products`).
+      security:
+        - BearerJWT: []
+        - ApiKey: []
+      parameters:
+        - $ref: "#/components/parameters/BarcodePath"
+      responses:
+        "200":
+          description: Produk ditemukan.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+              examples:
+                ditemukan_di_katalog:
+                  summary: Ada di katalog CekJajan
+                  value:
+                    id: prod-001
+                    barcode: '8999999000000'
+                    nama: Biskuit Contoh
+                    merek: Merek Contoh
+                    kategori: makanan
+                    nutrisi:
+                      takaran_saji: 30
+                      satuan_takaran: g
+                      sajian_per_kemasan: 3
+                      gula_g: 6
+                      natrium_mg: 110
+                      lemak_g: 7
+                    sumber: katalog
+                    status_verifikasi: terverifikasi
+                dari_open_food_facts:
+                  summary: Diambil dari Open Food Facts, belum terverifikasi
+                  value:
+                    id: prod-002
+                    barcode: '8999999000017'
+                    nama: Teh Manis Kemasan Contoh
+                    merek: Merek Contoh
+                    kategori: minuman
+                    nutrisi:
+                      takaran_saji: 200
+                      satuan_takaran: ml
+                      sajian_per_kemasan: 1
+                      gula_g: 15
+                      natrium_mg: 30
+                      lemak_g: 0
+                    sumber: open_food_facts
+                    status_verifikasi: belum_terverifikasi
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /products:
+    post:
+      tags: [Produk]
+      summary: Tambah produk secara manual
+      description: Cadangan bila barcode tidak ditemukan. Produk baru berstatus `belum_terverifikasi`.
+      security:
+        - BearerJWT: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProductInput"
+            example:
+              barcode: '8999999000017'
+              nama: Teh Manis Kemasan Contoh
+              merek: Merek Contoh
+              kategori: minuman
+              nutrisi:
+                takaran_saji: 200
+                satuan_takaran: ml
+                sajian_per_kemasan: 1
+                gula_g: 15
+                natrium_mg: 30
+                lemak_g: 0
+      responses:
+        "201":
+          description: Produk dibuat.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+              example:
+                id: prod-002
+                barcode: '8999999000017'
+                nama: Teh Manis Kemasan Contoh
+                merek: Merek Contoh
+                kategori: minuman
+                nutrisi:
+                  takaran_saji: 200
+                  satuan_takaran: ml
+                  sajian_per_kemasan: 1
+                  gula_g: 15
+                  natrium_mg: 30
+                  lemak_g: 0
+                sumber: manual
+                status_verifikasi: belum_terverifikasi
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /assessments:
+    post:
+      tags: [Penilaian]
+      summary: Nilai produk (barcode atau nilai gizi langsung)
+      description: |
+        Isi **salah satu**: `barcode` atau `nutrisi`. Bila `child_id` diisi, respons menyertakan
+        `dampak_jatah_harian` (persen jatah hari ini yang akan terpakai oleh satu sajian ini).
+        Penilaian ini **tidak mencatat konsumsi**. Untuk mencatat, pakai `POST /children/{childId}/consumptions`.
+        `child_id` hanya berlaku untuk pemanggil dengan JWT pemilik anak tersebut. Pemanggil dengan
+        API key tidak boleh mengirim `child_id` (dijawab 403).
+      security:
+        - BearerJWT: []
+        - ApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AssessmentRequest"
+            examples:
+              dariBarcode:
+                summary: Dari barcode
+                value:
+                  barcode: "8999999000000"
+                  jumlah_sajian: 1
+                  child_id: "child-001"
+              dariNilaiGizi:
+                summary: Dari nilai gizi langsung
+                value:
+                  nutrisi:
+                    takaran_saji: 200
+                    satuan_takaran: ml
+                    gula_g: 15
+                    natrium_mg: 30
+                    lemak_g: 0
+                  jumlah_sajian: 1
+      responses:
+        "200":
+          description: Hasil penilaian.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Assessment"
+              examples:
+                dariBarcode:
+                  summary: Dari barcode, dengan child_id
+                  value:
+                    sumber_data: katalog
+                    produk:
+                      id: prod-001
+                      barcode: '8999999000000'
+                      nama: Biskuit Contoh
+                      merek: Merek Contoh
+                      kategori: makanan
+                      nutrisi:
+                        takaran_saji: 30
+                        satuan_takaran: g
+                        sajian_per_kemasan: 3
+                        gula_g: 6
+                        natrium_mg: 110
+                        lemak_g: 7
+                      sumber: katalog
+                      status_verifikasi: terverifikasi
+                    ggl_per_sajian:
+                      gula_g: 6
+                      garam_g: 0.275
+                      lemak_g: 7
+                    nutri_level: D
+                    penanda: {level: D, skala: 4, ikon: batasi, label: Batasi, warna: merah}
+                    penanda_zat:
+                      gula: {level: D, skala: 4, ikon: batasi, label: Batasi, warna: merah}
+                      garam: {level: C, skala: 3, ikon: hati_hati, label: Hati-hati, warna: kuning}
+                      lemak: {level: D, skala: 4, ikon: batasi, label: Batasi, warna: merah}
+                    ringkasan: Gula dan lemak tinggi per 100 g, natrium sedang. Sebaiknya dibatasi (perkiraan, memakai ambang minuman BPOM).
+                    dampak_jatah_harian:
+                      gula_g: 14.6
+                      garam_g: 11
+                      lemak_g: 12.7
+                    disclaimer: Hasil berupa perkiraan, bukan diagnosis atau pengganti saran tenaga kesehatan.
+                    dinilai_pada: '2026-11-23T08:00:00Z'
+                dariNilaiGizi:
+                  summary: Dari nilai gizi langsung, tanpa child_id
+                  value:
+                    sumber_data: input_langsung
+                    ggl_per_sajian:
+                      gula_g: 15
+                      garam_g: 0.075
+                      lemak_g: 0
+                    nutri_level: C
+                    penanda: {level: C, skala: 3, ikon: hati_hati, label: Hati-hati, warna: kuning}
+                    penanda_zat:
+                      gula: {level: C, skala: 3, ikon: hati_hati, label: Hati-hati, warna: kuning}
+                      garam: {level: B, skala: 2, ikon: baik, label: Baik, warna: hijau_muda}
+                      lemak: {level: A, skala: 1, ikon: sangat_baik, label: Sangat baik, warna: hijau_tua}
+                    ringkasan: Gula cukup tinggi untuk satu gelas. Pilih yang lebih rendah gula bila sering diminum.
+                    dampak_jatah_harian: null
+                    disclaimer: Hasil berupa perkiraan, bukan diagnosis atau pengganti saran tenaga kesehatan.
+                    dinilai_pada: '2026-11-23T08:00:00Z'
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /children:
+    get:
+      tags: [Anak]
+      summary: Daftar anak milik akun orang tua
+      description: "Daftar semua anak milik akun. Pembatasan satu anak untuk versi gratis adalah urusan konteks Langganan & Pembayaran dan tidak ditegakkan di versi ini."
+      security:
+        - BearerJWT: []
+      responses:
+        "200":
+          description: Daftar anak.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Child"
+              example:
+                items:
+                  - id: child-001
+                    nama_panggilan: Anak Uji
+                    usia_tahun: 8
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Anak]
+      summary: Tambah profil anak
+      security:
+        - BearerJWT: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChildInput"
+            example:
+              nama_panggilan: Anak Uji
+              usia_tahun: 8
+      responses:
+        "201":
+          description: Profil anak dibuat.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Child"
+              example:
+                id: child-001
+                nama_panggilan: Anak Uji
+                usia_tahun: 8
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /children/{childId}:
+    get:
+      tags: [Anak]
+      summary: Detail profil anak
+      security:
+        - BearerJWT: []
+      parameters:
+        - $ref: "#/components/parameters/ChildIdPath"
+      responses:
+        "200":
+          description: Profil anak.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Child"
+              example:
+                id: child-001
+                nama_panggilan: Anak Uji
+                usia_tahun: 8
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /children/{childId}/daily-quota:
+    get:
+      tags: [Jatah Harian]
+      summary: Jatah GGL harian dan persen yang sudah terpakai
+      description: |
+        Batas harian ditentukan dari usia anak. Rujukan: Permenkes 30/2013 (gula 10% dari energi)
+        dan Permenkes 28/2019 tentang AKG (energi, natrium, lemak). Gula = 10% energi / 4 kkal per
+        gram, garam = natrium AKG x 2,5 / 1000, lemak = AKG lemak total.
+
+        | Usia | Gula | Garam | Lemak |
+        |---|---|---|---|
+        | 4-6 tahun | 35 g | 2,25 g | 50 g |
+        | 7-9 tahun | 41 g | 2,5 g | 55 g |
+        | 10-12 tahun | 47,5 g | 3,25 g | 65 g |
+
+        Untuk 10-12 tahun dipakai nilai yang lebih kecil karena profil anak tidak mencatat jenis
+        kelamin. AKG natrium adalah angka kecukupan, dipakai di sini sebagai pagu praktis.
+        Role `anak` hanya boleh membaca endpoint ini untuk profilnya sendiri.
+      security:
+        - BearerJWT: []
+      parameters:
+        - $ref: "#/components/parameters/ChildIdPath"
+        - $ref: "#/components/parameters/DateQuery"
+      responses:
+        "200":
+          description: Jatah harian.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DailyQuota"
+              example:
+                child_id: child-001
+                tanggal: '2026-11-23'
+                batas:
+                  gula_g: 41
+                  garam_g: 2.5
+                  lemak_g: 55
+                terpakai:
+                  gula_g: 21
+                  garam_g: 0.35
+                  lemak_g: 7
+                persen_terpakai:
+                  gula_g: 51.2
+                  garam_g: 14
+                  lemak_g: 12.7
+                status: aman
+                peringatan: null
+                alternatif: []
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /children/{childId}/consumptions:
+    get:
+      tags: [Jatah Harian]
+      summary: Riwayat konsumsi anak pada satu tanggal
+      description: "Riwayat satu tanggal (bawaan hari ini). Riwayat jangka panjang adalah fitur premium dan di luar cakupan versi ini."
+      security:
+        - BearerJWT: []
+      parameters:
+        - $ref: "#/components/parameters/ChildIdPath"
+        - $ref: "#/components/parameters/DateQuery"
+      responses:
+        "200":
+          description: Daftar konsumsi.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Consumption"
+              example:
+                items:
+                  - id: cons-001
+                    child_id: child-001
+                    product_id: prod-001
+                    jumlah_sajian: 1
+                    waktu_konsumsi: '2026-11-23T03:30:00Z'
+                    ggl:
+                      gula_g: 6
+                      garam_g: 0.275
+                      lemak_g: 7
+                  - id: cons-002
+                    child_id: child-001
+                    product_id: prod-002
+                    jumlah_sajian: 1
+                    waktu_konsumsi: '2026-11-23T05:10:00Z'
+                    ggl:
+                      gula_g: 15
+                      garam_g: 0.075
+                      lemak_g: 0
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [Jatah Harian]
+      summary: Catat konsumsi produk
+      description: Memperbarui jatah harian anak dan mengembalikan jatah terbaru.
+      security:
+        - BearerJWT: []
+      parameters:
+        - $ref: "#/components/parameters/ChildIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConsumptionInput"
+            example:
+              product_id: prod-002
+              jumlah_sajian: 1
+      responses:
+        "201":
+          description: Konsumsi tercatat, jatah terbaru ikut dikembalikan.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  konsumsi:
+                    $ref: "#/components/schemas/Consumption"
+                  jatah_terbaru:
+                    $ref: "#/components/schemas/DailyQuota"
+              example:
+                konsumsi:
+                  id: cons-002
+                  child_id: child-001
+                  product_id: prod-002
+                  jumlah_sajian: 1
+                  waktu_konsumsi: '2026-11-23T05:10:00Z'
+                  ggl:
+                    gula_g: 15
+                    garam_g: 0.075
+                    lemak_g: 0
+                jatah_terbaru:
+                  child_id: child-001
+                  tanggal: '2026-11-23'
+                  batas:
+                    gula_g: 41
+                    garam_g: 2.5
+                    lemak_g: 55
+                  terpakai:
+                    gula_g: 21
+                    garam_g: 0.35
+                    lemak_g: 7
+                  persen_terpakai:
+                    gula_g: 51.2
+                    garam_g: 14
+                    lemak_g: 12.7
+                  status: aman
+                  peringatan: null
+                  alternatif: []
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+components:
+  securitySchemes:
+    BearerJWT:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Token dari `/auth/login`. Berisi id pengguna dan role (`orang_tua`, `anak`).
+        Masa berlaku: 24 jam.
+    ApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: Satu API key per kelompok pemanggil, dapat dicabut. Cara meminta ada di deskripsi API.
+
+  parameters:
+    BarcodePath:
+      name: barcode
+      in: path
+      required: true
+      description: Barcode produk (EAN-8, EAN-13, atau UPC-A).
+      schema:
+        type: string
+        pattern: "^[0-9]{8,14}$"
+        example: "8999999000000"
+    ChildIdPath:
+      name: childId
+      in: path
+      required: true
+      schema:
+        type: string
+    DateQuery:
+      name: date
+      in: query
+      required: false
+      description: Tanggal (YYYY-MM-DD). Bawaan hari ini (zona waktu Asia/Jakarta).
+      schema:
+        type: string
+        format: date
+
+  responses:
+    BadRequest:
+      description: Parameter atau isi request tidak valid.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: {code: bad_request, message: Parameter gula_g wajib diisi dan tidak boleh negatif.}
+    Unauthorized:
+      description: Token atau API key tidak ada atau salah.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: {code: unauthorized, message: API key salah.}
+    Forbidden:
+      description: Tidak berhak mengakses data ini (bukan milik akun Anda).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Data tidak ditemukan.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: {code: not_found, message: Produk dengan barcode ini tidak ditemukan.}
+    TooManyRequests:
+      description: Terlalu sering memanggil. Coba lagi setelah jeda pada header Retry-After.
+      headers:
+        Retry-After:
+          description: Jeda dalam detik.
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: {code: too_many_requests, message: Batas pemanggilan terlampaui.}
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: {type: string}
+            message: {type: string}
+
+    HealthStatus:
+      type: object
+      properties:
+        status: {type: string, example: ok}
+        service: {type: string, example: cekjajan}
+        version: {type: string, example: 0.2.0}
+
+    NutritionFacts:
+      type: object
+      description: Nilai gizi per **satu sajian**, seperti pada tabel informasi nilai gizi.
+      required: [takaran_saji, satuan_takaran, gula_g, natrium_mg, lemak_g]
+      properties:
+        takaran_saji: {type: number, minimum: 0.1, example: 30}
+        satuan_takaran: {type: string, enum: [g, ml], example: g}
+        sajian_per_kemasan: {type: number, minimum: 0, example: 3}
+        gula_g: {type: number, minimum: 0, example: 6}
+        natrium_mg: {type: number, minimum: 0, example: 110}
+        lemak_g: {type: number, minimum: 0, example: 7}
+
+    GGLAmount:
+      type: object
+      description: Jumlah gula, garam, dan lemak.
+      properties:
+        gula_g: {type: number}
+        garam_g: {type: number, description: "Dihitung dari natrium: natrium_mg x 2,5 / 1000 (konversi standar natrium ke garam)."}
+        lemak_g: {type: number}
+
+    GGLPercent:
+      type: object
+      description: Persen terhadap batas harian.
+      properties:
+        gula_g: {type: number}
+        garam_g: {type: number}
+        lemak_g: {type: number}
+
+    GGLPerSajian:
+      type: object
+      properties:
+        gula_g: {type: number}
+        garam_g: {type: number}
+        lemak_g: {type: number}
+
+    NutriLevel:
+      type: string
+      enum: [A, B, C, D]
+      description: |
+        Perkiraan Nutri-Level (PerBPOM 10/2026). A (hijau tua): kandungan gula, garam, dan lemak
+        paling rendah. B (hijau muda): rendah. C (kuning): perlu dikonsumsi dengan bijak.
+        D (merah): paling tinggi, perlu dibatasi. Ambang lengkap ada pada `GET /assessments/quick`.
+
+    Penanda:
+      type: object
+      description: |
+        Penanda baik atau buruk pada skala 1 (paling baik) sampai 4 (paling buruk).
+        1 = level A, ikon sangat_baik, Sangat baik, hijau_tua. 2 = level B, ikon baik, Baik, hijau_muda.
+        3 = level C, ikon hati_hati, Hati-hati, kuning. 4 = level D, ikon batasi, Batasi, merah.
+        Field `ikon` adalah kunci ilustrasi. Gambarnya disediakan oleh aplikasi (aset ilustrasi
+        CekJajan), bukan oleh API.
+      required: [level, skala, ikon, label, warna]
+      properties:
+        level: {type: string, enum: [A, B, C, D]}
+        skala: {type: integer, minimum: 1, maximum: 4}
+        ikon: {type: string, enum: [sangat_baik, baik, hati_hati, batasi]}
+        label: {type: string, enum: [Sangat baik, Baik, Hati-hati, Batasi]}
+        warna: {type: string, enum: [hijau_tua, hijau_muda, kuning, merah]}
+
+    PenandaPerZat:
+      type: object
+      description: Penanda untuk masing-masing zat (gula, garam dari natrium, lemak total).
+      required: [gula, garam, lemak]
+      properties:
+        gula:
+          $ref: "#/components/schemas/Penanda"
+        garam:
+          $ref: "#/components/schemas/Penanda"
+        lemak:
+          $ref: "#/components/schemas/Penanda"
+
+    Assessment:
+      type: object
+      required: [sumber_data, ggl_per_sajian, nutri_level, penanda, penanda_zat, disclaimer]
+      properties:
+        sumber_data:
+          type: string
+          enum: [katalog, open_food_facts, manual, input_langsung]
+        produk:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/Product"
+        ggl_per_sajian:
+          $ref: "#/components/schemas/GGLPerSajian"
+        nutri_level:
+          $ref: "#/components/schemas/NutriLevel"
+        penanda:
+          $ref: "#/components/schemas/Penanda"
+        penanda_zat:
+          $ref: "#/components/schemas/PenandaPerZat"
+        ringkasan:
+          type: string
+          description: Kalimat singkat yang mudah dipahami orang tua.
+        dampak_jatah_harian:
+          nullable: true
+          description: Persen jatah hari ini yang terpakai bila satu sajian dikonsumsi. Null bila `child_id` tidak dikirim.
+          allOf:
+            - $ref: "#/components/schemas/GGLPercent"
+        disclaimer:
+          type: string
+          example: Hasil berupa perkiraan, bukan diagnosis atau pengganti saran tenaga kesehatan.
+        dinilai_pada:
+          type: string
+          format: date-time
+
+    AssessmentRequest:
+      type: object
+      description: Isi salah satu, `barcode` atau `nutrisi`.
+      properties:
+        barcode:
+          type: string
+          pattern: "^[0-9]{8,14}$"
+        nutrisi:
+          $ref: "#/components/schemas/NutritionFacts"
+        jumlah_sajian:
+          type: number
+          minimum: 0.1
+          default: 1
+        child_id:
+          type: string
+          description: Opsional. Bila diisi, respons menyertakan dampak ke jatah harian anak.
+      oneOf:
+        - required: [barcode]
+        - required: [nutrisi]
+
+    Product:
+      type: object
+      required: [id, nama, kategori, nutrisi, sumber, status_verifikasi]
+      properties:
+        id: {type: string}
+        barcode: {type: string, nullable: true}
+        nama: {type: string, example: Biskuit Contoh}
+        merek: {type: string, nullable: true}
+        kategori: {type: string, enum: [makanan, minuman]}
+        nutrisi:
+          $ref: "#/components/schemas/NutritionFacts"
+        sumber: {type: string, enum: [katalog, open_food_facts, manual]}
+        status_verifikasi: {type: string, enum: [terverifikasi, belum_terverifikasi]}
+
+    ProductInput:
+      type: object
+      required: [nama, kategori, nutrisi]
+      properties:
+        barcode: {type: string, pattern: "^[0-9]{8,14}$"}
+        nama: {type: string}
+        merek: {type: string}
+        kategori: {type: string, enum: [makanan, minuman]}
+        nutrisi:
+          $ref: "#/components/schemas/NutritionFacts"
+
+    RegisterRequest:
+      type: object
+      required: [nama, email, password]
+      properties:
+        nama: {type: string}
+        email: {type: string, format: email}
+        password:
+          type: string
+          minLength: 10
+          description: "Minimal 10 karakter."
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: {type: string, format: email}
+        password: {type: string}
+
+    User:
+      type: object
+      properties:
+        id: {type: string}
+        nama: {type: string}
+        email: {type: string, format: email}
+        role: {type: string, enum: [orang_tua, anak]}
+
+    AuthToken:
+      type: object
+      properties:
+        token: {type: string}
+        token_type: {type: string, example: Bearer}
+        expires_in: {type: integer, description: "Detik (86400 = 24 jam)."}
+        user:
+          $ref: "#/components/schemas/User"
+
+    Child:
+      type: object
+      required: [id, nama_panggilan, usia_tahun]
+      properties:
+        id: {type: string}
+        nama_panggilan: {type: string, example: Anak Uji}
+        usia_tahun: {type: integer, minimum: 4, maximum: 12, example: 8}
+
+    ChildInput:
+      type: object
+      required: [nama_panggilan, usia_tahun]
+      description: Pakai nama panggilan dan data uji, bukan data pribadi asli.
+      properties:
+        nama_panggilan: {type: string}
+        usia_tahun: {type: integer, minimum: 4, maximum: 12}
+
+    DailyQuota:
+      type: object
+      required: [child_id, tanggal, batas, terpakai, persen_terpakai, status]
+      properties:
+        child_id: {type: string}
+        tanggal: {type: string, format: date}
+        batas:
+          $ref: "#/components/schemas/GGLAmount"
+        terpakai:
+          $ref: "#/components/schemas/GGLAmount"
+        persen_terpakai:
+          $ref: "#/components/schemas/GGLPercent"
+        status:
+          type: string
+          enum: [aman, hampir_habis, terlampaui]
+          description: "aman: semua persen terpakai di bawah 80. hampir_habis: persen tertinggi 80 sampai di bawah 100. terlampaui: persen tertinggi 100 atau lebih."
+        peringatan:
+          type: string
+          nullable: true
+        alternatif:
+          type: array
+          description: Saran produk dengan Nutri-Level lebih baik (fitur premium). Di versi ini selalu array kosong.
+          items:
+            $ref: "#/components/schemas/Product"
+
+    ConsumptionInput:
+      type: object
+      required: [product_id]
+      properties:
+        product_id: {type: string}
+        jumlah_sajian: {type: number, minimum: 0.1, default: 1}
+        waktu_konsumsi:
+          type: string
+          format: date-time
+          description: Bawaan sekarang.
+
+    Consumption:
+      type: object
+      properties:
+        id: {type: string}
+        child_id: {type: string}
+        product_id: {type: string}
+        jumlah_sajian: {type: number}
+        waktu_konsumsi: {type: string, format: date-time}
+        ggl:
+          $ref: "#/components/schemas/GGLAmount"

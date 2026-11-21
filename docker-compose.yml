@@ -1,0 +1,24 @@
+services:
+  core-service:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    mem_limit: 256m
+    cpus: 0.5
+    volumes:
+      - ./data:/data
+
+  gateway:
+    image: nginx:1.28-alpine
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_PORT:-80}:80"
+    volumes:
+      - ./gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - core-service
+    mem_limit: 64m
+    cpus: 0.25
+
+# Cloudflare Tunnel tidak ada di sini: cloudflared berjalan sebagai service di STB
+# dan meneruskan https://mandabita.stei.site/api ke http://localhost:80.

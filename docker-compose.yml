@@ -6,7 +6,7 @@ services:
     mem_limit: 256m
     cpus: 0.5
     volumes:
-      - ./data:/data
+      - cekjajan-data:/data
 
   gateway:
     image: nginx:1.28-alpine
@@ -19,6 +19,9 @@ services:
       - core-service
     mem_limit: 64m
     cpus: 0.25
+
+volumes:
+  cekjajan-data:
 
 # Cloudflare Tunnel tidak ada di sini: cloudflared berjalan sebagai service di STB
 # dan meneruskan https://mandabita.stei.site/api ke http://localhost:80.

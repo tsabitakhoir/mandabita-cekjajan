@@ -9,6 +9,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY openapi.yaml ./openapi.yaml
 
 RUN useradd --system --no-create-home appuser && mkdir -p /data && chown appuser /data
 USER appuser
